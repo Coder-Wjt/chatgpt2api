@@ -10,6 +10,7 @@ from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import (
     EditableFileTaskCleanupError,
+    EditableFileTaskCapacityError,
     EditableFileTaskInvalidIdError,
     EditableFileTaskNotFoundError,
     EditableFileTaskNotTerminalError,
@@ -116,6 +117,8 @@ def create_router() -> APIRouter:
     async def submit_editable_file_task(submit, identity, **kwargs):
         try:
             return await run_in_threadpool(submit, identity, **kwargs)
+        except EditableFileTaskCapacityError as exc:
+            raise HTTPException(status_code=429, detail={"error": str(exc)}, headers={"Retry-After": "5"}) from exc
         except EditableFileTaskInvalidIdError as exc:
             raise HTTPException(
                 status_code=400,

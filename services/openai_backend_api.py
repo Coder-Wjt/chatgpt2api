@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Literal, Optional
 from urllib.parse import unquote, urlparse
 
 from curl_cffi import CurlInfo, CurlOpt, requests
@@ -798,7 +798,10 @@ class OpenAIBackendAPI:
         }
         normalized_effort = normalize_thinking_effort(thinking_effort)
         if normalized_effort:
-            payload["thinking_effort"] = normalized_effort
+            # Web conversation accepts standard/extended, not API low/medium/high.
+            payload["thinking_effort"] = (
+                "standard" if normalized_effort in {"low", "medium"} else "extended"
+            )
         return payload
 
     def _image_model_slug(self, model: str) -> str:
@@ -3584,8 +3587,8 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
-        response = self.session.post(
-            self.base_url + path,
+        response = self._chat_request(
+            "conversation", "POST", self.base_url + path,
             headers=self._conversation_headers(path, requirements),
             json=payload,
             timeout=300,
@@ -3640,13 +3643,61 @@ class OpenAIBackendAPI:
         finally:
             response.close()
 
+    def _chat_request(self, stage: str, method: Literal["GET", "POST"], url: str, **kwargs: Any) -> Any:
+        """Trace the shared chat transport without logging credentials or payloads."""
+        started = time.monotonic()
+        profile = self.proxy_profile
+        fields: dict[str, Any] = {
+            "event": "chat_upstream_request",
+            "transport_id": getattr(self, "_chat_transport_id", ""),
+            "stage": stage,
+            "method": method,
+            "proxy_source": profile.proxy_source,
+            "has_proxy": bool(profile.proxy_url),
+            "proxy_host": urlparse(profile.proxy_url).hostname or "",
+            "timeout_secs": kwargs.get("timeout"),
+        }
+        if not fields["transport_id"]:
+            self._chat_transport_id = new_uuid()
+            fields["transport_id"] = self._chat_transport_id
+        logger.info({**fields, "outcome": "started"})
+        try:
+            response = self.session.request(method, url, **kwargs)
+        except Exception as exc:
+            setattr(exc, "upstream_stage", stage)
+            # Exception strings may contain URLs, credentials or response bodies.
+            logger.warning({
+                **fields, "outcome": "failed", "error_type": type(exc).__name__,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                **_response_http_timing(getattr(exc, "response", None)),
+            })
+            raise
+        logger.info({
+            **fields, "outcome": "response",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            **_response_http_timing(response),
+        })
+        return response
+
     def _bootstrap(self, timeout_secs: float = 30.0) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=timeout_secs,
-        )
+        started = time.monotonic()
+        try:
+            response = self._chat_request(
+                "bootstrap", "GET", self.base_url + "/",
+                headers=self._bootstrap_headers(),
+                timeout=min(10.0, timeout_secs),
+            )
+        except (TimeoutError, requests.exceptions.Timeout):
+            remaining = timeout_secs - (time.monotonic() - started)
+            if remaining <= 0:
+                raise
+            # Only replay this idempotent GET, never the generation POST.
+            response = self._chat_request(
+                "bootstrap", "GET", self.base_url + "/",
+                headers=self._bootstrap_headers(),
+                timeout=remaining,
+            )
         ensure_ok(response, "bootstrap", credential_scope="public")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
@@ -3672,8 +3723,8 @@ class OpenAIBackendAPI:
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
-        response = self.session.post(
-            self.base_url + prepare_path,
+        response = self._chat_request(
+            "chat_requirements_prepare", "POST", self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
             timeout=request_timeout(),
@@ -3701,8 +3752,8 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
-        response = self.session.post(
-            self.base_url + finalize_path,
+        response = self._chat_request(
+            "chat_requirements_finalize", "POST", self.base_url + finalize_path,
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
                 "prepare_token": prepare_data.get("prepare_token", ""),

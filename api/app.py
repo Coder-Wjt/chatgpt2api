@@ -11,6 +11,8 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, prompts, system
 from api.errors import install_exception_handlers
+from api.request_limits import RequestLimitsMiddleware
+from services.editable_file_task_service import editable_file_task_service
 from api.support import resolve_web_asset, start_account_lifecycle_watcher
 from services.account_service import account_service
 from services.backup_service import backup_service
@@ -53,6 +55,7 @@ def create_app() -> FastAPI:
         _configure_threadpool()
         start_genbox_push_service()
         image_task_service.start()
+        editable_file_task_service.start()
         try:
             projection_reset = await run_in_threadpool(
                 dashboard_metrics_service.reset_projection_schema_if_needed
@@ -102,6 +105,7 @@ def create_app() -> FastAPI:
             dashboard_metrics_thread.join(timeout=1)
             await run_in_threadpool(cleanup_thread.join, RETENTION_SHUTDOWN_TIMEOUT_SECS)
             await run_in_threadpool(image_task_service.shutdown_cancel_pending_and_wait)
+            await run_in_threadpool(editable_file_task_service.shutdown)
             await run_in_threadpool(shutdown_genbox_push_service)
             try:
                 await run_in_threadpool(
@@ -121,6 +125,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         expose_headers=["X-Export-Requested", "X-Exported", "X-Skipped"],
     )
+    app.add_middleware(RequestLimitsMiddleware)
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
     app.include_router(image_tasks.create_router())

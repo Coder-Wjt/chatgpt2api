@@ -51,7 +51,11 @@ test_batch_output/
 skills/
 standalone/
 test/
-tests/
+/tests/*
+!/tests/conftest.py
+!/tests/security/
+/tests/security/*
+!/tests/security/test_*.py
 web-vue/tests/
 scripts/test_*.py
 scripts/image_upscale/node_modules/

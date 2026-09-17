@@ -1,0 +1,9 @@
+# Build the reviewed checkout locally instead of pulling an older release.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:security-local
+    volumes:
+      - /app

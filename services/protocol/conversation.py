@@ -45,6 +45,7 @@ from services.proxy_service import ImageEgressDeadlineError, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
     IMAGE_MODELS,
+    MAX_JSON_EDIT_IMAGES,
     UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
@@ -387,6 +388,7 @@ def message_text(content: Any) -> str:
 
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
     normalized = []
+    remaining_images = MAX_JSON_EDIT_IMAGES
     if config.global_system_prompt:
         normalized.append({"role": "system", "content": config.global_system_prompt})
     system_text = message_text(system)
@@ -401,7 +403,8 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
             text = message_text(content)
             images: list[tuple[bytes, str]] = []
             if role == "user":
-                images.extend(extract_image_from_message_content(content))
+                images.extend(extract_image_from_message_content(content, max_images=remaining_images))
+                remaining_images -= len(images)
                 if isinstance(content, list):
                     for part in content:
                         if not isinstance(part, dict) or part.get("type") != "image":
@@ -1683,6 +1686,10 @@ def stream_image_outputs(
                     upstream_event_type=raw_type,
                 )
     except (TimeoutError, curl_exceptions.Timeout) as exc:
+        if getattr(exc, "upstream_stage", "") in {
+            "bootstrap", "chat_requirements_prepare", "chat_requirements_finalize",
+        }:
+            raise
         yield _recover_after_image_stream_timeout(
             backend,
             request,

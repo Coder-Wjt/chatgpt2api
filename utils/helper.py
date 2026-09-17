@@ -17,6 +17,7 @@ from curl_cffi.requests.models import STREAM_END
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
+from utils.remote_images import download_image_url
 
 WEB_IMAGE_MODELS = (
     "gpt-image-2",
@@ -64,6 +65,8 @@ def _decode_json_image_string(value: str, index: int, filename: str | None = Non
         resolved_mime = "image/jpeg"
     if resolved_mime not in SUPPORTED_JSON_IMAGE_MIME_TYPES:
         raise HTTPException(status_code=400, detail={"error": "unsupported image mime type"})
+    if len(encoded) > ((MAX_JSON_IMAGE_BYTES + 2) // 3) * 4:
+        raise HTTPException(status_code=400, detail={"error": "image file is too large"})
     try:
         image_data = base64.b64decode(encoded, validate=True)
     except Exception as exc:
@@ -198,6 +201,35 @@ def ensure_ok(
 ) -> None:
     if 200 <= response.status_code < 300:
         return
+    # curl_cffi leaves streamed bodies in its queue; .text is empty until read.
+    stream_queue = getattr(response, "queue", None)
+    if stream_queue is not None:
+        collected = bytearray()
+        deadline = time.monotonic() + 2.0
+        try:
+            while len(collected) < 8192:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    chunk = stream_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if chunk is STREAM_END or isinstance(chunk, RequestException):
+                    break
+                if isinstance(chunk, bytes):
+                    collected.extend(chunk[:8192 - len(collected)])
+        finally:
+            # Do not wait for stream_task.result() on a stalled error response.
+            quit_now = getattr(response, "quit_now", None)
+            if quit_now is not None:
+                quit_now.set()
+            response.content = bytes(collected)
+            stream_task = getattr(response, "stream_task", None)
+            if stream_task is not None:
+                stream_task.add_done_callback(lambda _task: response.close())
+            else:
+                response.close()
     body: Any = response.text
     try:
         body = response.json()
@@ -527,49 +559,18 @@ def _message_image_url(value: object) -> str:
 def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     source = _message_image_url(value)
     if source.startswith("data:"):
-        header, _, data = source.partition(",")
-        mime = header.split(";")[0].removeprefix("data:") or "image/png"
-        return base64.b64decode(data), mime
+        data, _, mime = _decode_json_image_string(source, 1)
+        return data, mime
     if not source.startswith(("http://", "https://")):
         return None
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
-            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
-    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
-    if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if not mime.startswith("image/") and guessed_mime.startswith("image/"):
-        mime = guessed_mime
-    if not mime.startswith("image/"):
-        mime = "image/png"
-    return image_data, mime
+    return download_image_url(source, max_bytes=MAX_JSON_IMAGE_BYTES)
 
 
 def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] | None:
     data = item.get("data")
     if isinstance(data, (bytes, bytearray)):
+        if len(data) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image file is too large"})
         return bytes(data), str(item.get("mime") or item.get("mime_type") or "image/png")
     for key in ("image_url", "url"):
         image = _decode_message_image_url(item.get(key))
@@ -592,9 +593,12 @@ def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] |
     return None
 
 
-def extract_image_from_message_content(content: object) -> list[tuple[bytes, str]]:
+def extract_image_from_message_content(content: object, *, max_images: int | None = None) -> list[tuple[bytes, str]]:
     if not isinstance(content, list):
         return []
+    image_count = sum(isinstance(item, dict) and str(item.get("type") or "").strip() in {"image_url", "input_image", "image"} for item in content)
+    if image_count > (MAX_JSON_EDIT_IMAGES if max_images is None else max_images):
+        raise HTTPException(status_code=400, detail={"error": "too many image inputs"})
     images = []
     for item in content:
         if not isinstance(item, dict):

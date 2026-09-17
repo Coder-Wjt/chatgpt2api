@@ -78,6 +78,17 @@ flowchart LR
 - A command result represents the completed action or accepted asynchronous
   task. Polling and retry ownership must be explicit for asynchronous work.
 
+## Security boundaries
+
+`api/request_limits.py` bounds incoming write bodies before parsing and limits active
+body-bearing requests; read-only routes do not consume upload admission.
+`utils/remote_images.py` owns user-supplied remote image downloads for both chat
+and image-edit inputs: public-address checks, pinned DNS, per-hop redirect checks,
+TLS validation, total transfer timeouts, and callback-enforced byte limits.
+`EditableFileTaskService` uses `BoundedTaskRunner` for two active workers and four
+queued tasks, with at most two admitted tasks per owner. Shutdown cancels queued
+tasks and restart recovery marks interrupted work as failed.
+
 ## Shared infrastructure
 
 | Module | Role | Boundary |

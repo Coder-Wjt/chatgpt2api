@@ -22,3 +22,12 @@ web_dist
 
 assets
 README.md
+
+.env
+.env.*
+data
+config.local*.json
+.codex
+.git*
+scripts/image_upscale/node_modules
+web-vue/tests

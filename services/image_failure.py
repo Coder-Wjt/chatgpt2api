@@ -330,6 +330,8 @@ def public_image_error_message(
     failure: ImageFailure,
     error: BaseException | None = None,
 ) -> str:
+    if failure.code == "upstream_connection_timeout":
+        return "连接 ChatGPT 上游超时，请稍后重试或检查代理出口。"
     if failure.code == "image_poll_timeout":
         return IMAGE_TIMEOUT_PUBLIC_MESSAGE
     if failure.code in {"image_stream_interrupted", "image_stream_timeout"}:

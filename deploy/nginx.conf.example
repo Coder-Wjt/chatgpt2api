@@ -1,0 +1,38 @@
+# Include inside nginx's http context. Replace api.example.com and certificate paths.
+limit_req_zone $binary_remote_addr zone=chatgpt2api_requests:10m rate=10r/s;
+limit_conn_zone $binary_remote_addr zone=chatgpt2api_connections:10m;
+
+server {
+    listen 80;
+    server_name api.example.com;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+    ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+    client_max_body_size 150m;
+    client_body_timeout 60s;
+    limit_req_status 429;
+    limit_conn_status 429;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy same-origin always;
+    location / {
+        limit_req zone=chatgpt2api_requests burst=30 nodelay;
+        limit_conn chatgpt2api_connections 20;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 1300s;
+        proxy_send_timeout 1300s;
+    }
+}

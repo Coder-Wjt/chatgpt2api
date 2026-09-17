@@ -33,6 +33,17 @@ jobs:
           uv sync --frozen
           uv run python -m compileall -q api contracts services utils main.py
 
+      - name: Audit Python dependencies
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes -o /tmp/chatgpt2api-requirements.txt
+          uvx pip-audit --no-deps --disable-pip -r /tmp/chatgpt2api-requirements.txt
+
+      - name: Security boundary type checks
+        run: uvx ty check api/request_limits.py utils/remote_images.py --python .venv/bin/python
+
+      - name: Security regression tests
+        run: uv run pytest -q tests/security
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -45,6 +56,10 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm audit --audit-level=high
+
+      - name: Audit image processing dependencies
+        run: npm --prefix scripts/image_upscale audit --package-lock-only --audit-level=high
 
   release-bundle:
     if: startsWith(github.ref, 'refs/tags/v')

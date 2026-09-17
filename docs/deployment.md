@@ -2,7 +2,7 @@
 
 状态：当前
 
-本项目的发布镜像默认是 `ghcr.io/yukkcat/chatgpt2api:latest`。标准 Compose 将服务暴露在 `3000` 端口，使用 `chatgpt2api-runtime` 命名卷保存可更新的应用运行目录，并单独挂载本地 `data/` 和 `config.json`。运行时配置和数据不应提交到 Git。
+本项目的发布镜像默认是 `ghcr.io/yukkcat/chatgpt2api:latest`。标准 Compose 将服务绑定到 `127.0.0.1:3000`，使用 `chatgpt2api-runtime` 命名卷保存可更新的应用运行目录，并单独挂载本地 `data/` 和 `config.json`。运行时配置和数据不应提交到 Git。
 
 ## Docker 部署
 
@@ -16,6 +16,33 @@ docker compose up -d
 ```
 
 镜像中的 `/opt/chatgpt2api` 是只读应用种子，`/app` 是受管运行目录。首次启动或镜像版本变化时，入口脚本会用镜像种子刷新 `/app`，再按锁文件同步 Python 依赖；同一镜像正常重启时会保留控制台在线更新后的运行版本。业务数据始终留在独立的 `data/` 挂载中。
+
+### Nginx HTTPS 上线
+
+宿主机 Nginx 反代 `http://127.0.0.1:3000`，Compose 默认不再向公网网卡开放应用端口。
+在现有 `.env` 中设置 `CHATGPT2API_BASE_URL=https://你的域名`，保留私有管理员密钥。
+使用 [`../deploy/nginx.conf.example`](../deploy/nginx.conf.example) 对照现有站点配置，替换域名和证书路径后执行 `nginx -t`，验证通过再 reload。
+示例配置位于 Nginx 的 `http` 上下文，提供 HTTPS、150 MiB 请求上限、每 IP 速率与连接数限制，并关闭响应缓冲以支持 SSE。
+如果 Nginx 自身在容器内，应让它和应用共用私有 Docker 网络，并将 `proxy_pass` 改为应用服务名；容器里的 `127.0.0.1` 不是宿主机。不要为了反代而直接开放源站公网端口。
+
+应用在 JSON/multipart 解析前校验实际请求字节数，包括无 Content-Length 和伪造长度的请求。
+单请求最多 150 MiB，上传总时间最多 60 秒；每进程最多同时处理 8 个带请求体的写请求，SSE 在响应结束时释放容量；GET/HEAD 查询不占用该容量。
+超出大小返回 413，容量不足返回 429，上传超时返回 408。图片编辑仍限制单图 50 MiB、合计 100 MiB、最多 16 张；聊天参考图每张 10 MiB，整段对话最多 10 张。
+PPT/PSD 默认 2 个执行槽、4 个排队槽，每个 User Key 最多 2 个未完成任务，容量不足返回 429；重复 client_task_id 返回原任务。
+上述容量均按进程计算，标准部署保持单 Uvicorn worker；不要通过多 worker 绕过限制。
+
+从当前修复后的源码构建上线，使用构建 overlay，避免直接拉取尚未包含修复的旧 `latest`：
+
+```bash
+# 先按本文备份数据库、config.json 和文件；在实际部署目录执行。
+docker compose -f docker-compose.yml -f docker-compose.build.yml build --pull
+# 验证 Nginx 配置后再更新应用；保留原有业务数据挂载。
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --force-recreate --renew-anon-volumes
+```
+
+本地 PostgreSQL 部署须在上述两条命令中同时保留 `-f docker-compose.postgres.yml`。
+构建 overlay 使用匿名 `/app` 运行卷，`--renew-anon-volumes` 保证每次从新镜像初始化代码，避免同版本旧运行卷遮蔽安全修复。业务数据仍在独立挂载中。
+不要删除数据库卷；保留旧镜像及备份作为回滚来源。上线后验证 `/version`、未授权 `/v1/models` 返回 401、登录和 SSE 正常，并确认公网无法直连源站端口。
 
 ### 本地 PostgreSQL 18
 
@@ -167,3 +194,19 @@ docker compose down
 ```
 
 `docker image prune` 只清理未使用镜像，不会替代数据备份。
+
+### 聊天上游超时定位
+
+查看 Compose 服务的 `chat_upstream_request` 日志：
+
+```bash
+docker compose logs --since 10m app | rg chat_upstream_request
+```
+
+同一个 `transport_id` 串联 `bootstrap`、`chat_requirements_prepare`、`chat_requirements_finalize` 和 `conversation` 阶段。`proxy_source` 表示出口来源，`proxy_host` 表示选中的代理主机，`http_primary_ip` 是 curl 报告的实际连接地址。`outcome=failed` 记录失败阶段、异常类型和耗时；连接计时在 curl 未提供时为零，不能把零解释为该阶段已成功完成。流式 `conversation` 的 `response` 仅表示收到响应头，不表示整个回答完成。
+
+账号自定义代理优先于默认出口；账号设为继承才会采用默认配置。代理运行时扩展功能关闭不代表默认代理关闭。普通网站或 ChatGPT 首页可达，也不等于后续 Sentinel 和对话请求成功。日志不记录请求头、代理密码、令牌或对话正文；不要为排查开启原始 HTTP 凭据转储。
+
+Web 对话的 `reasoning_effort` / `thinking_effort` 会适配上游枚举：`low`、`medium` 使用 `standard`，`high`、`xhigh`、`extended` 使用 `extended`；默认和 `none` 不发送该字段。这是上游两档能力的兼容映射，不表示上游提供独立的低、中、高三档。流式 HTTP 错误正文最多读取 8 KiB、等待 2 秒，避免错误信息为空或排错读取无限阻塞。
+
+首页预热 GET 首次最多等待 10 秒，超时后最多使用剩余预算重试一次，总预算仍由调用方控制（通常 30 秒）。该策略不重发生成 POST。预热和 Sentinel 阶段失败归类为上游连接超时，不进入图片流恢复查询；已经进入生成阶段的恢复流程保持不变。

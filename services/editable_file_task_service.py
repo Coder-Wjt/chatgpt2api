@@ -15,12 +15,13 @@ from services.account_service import (
     account_service,
 )
 from services.config import DATA_DIR
+from services.bounded_task_runner import BoundedTaskRunner
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
 from services.storage.editable_file_task_repository import EditableFileTaskRepository
 from utils.file_names import is_safe_public_filename
-from utils.helper import new_uuid
+from utils.helper import new_uuid, normalize_json_edit_images
 from utils.timezone import beijing_from_timestamp, beijing_now_str
 
 TASK_STATUS_QUEUED = "queued"
@@ -186,6 +187,10 @@ class EditableFileTaskInvalidIdError(ValueError):
     pass
 
 
+class EditableFileTaskCapacityError(RuntimeError):
+    pass
+
+
 class EditableFileTaskCleanupError(RuntimeError):
     pass
 
@@ -200,6 +205,8 @@ class EditableFileTaskService:
         if repository is not None and database_url is not None:
             raise ValueError("provide repository or database_url, not both")
         self._lock = threading.RLock()
+        self._runner = BoundedTaskRunner(name="editable-file", max_workers=2, queue_size=4)
+        self._owner_pending: dict[str, int] = {}
         self._repository = repository or EditableFileTaskRepository(database_url)
         with self._lock:
             self._recover_pending_deletions_locked()
@@ -263,25 +270,70 @@ class EditableFileTaskService:
         task_id = _resolve_task_id(client_task_id)
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
-        now = _now_iso()
         with self._lock:
-            ts = time.time()
-            task, created = self._repository.create({
-                "id": task_id,
-                "storage_id": f"{EDITABLE_FILE_STORAGE_PREFIX}{new_uuid()}",
-                "owner_id": owner,
-                "status": TASK_STATUS_QUEUED,
-                "kind": kind,
-                "model": EDITABLE_FILE_MODEL,
-                "created_at": now,
-                "updated_at": now,
-                "created_ts": ts,
-                "updated_ts": ts,
-            })
-            if not created:
+            existing = self._repository.get(owner, task_id)
+            if existing is not None:
+                return _public_task(existing)
+            if self._owner_pending.get(owner, 0) >= 2:
+                raise EditableFileTaskCapacityError("Editable file task capacity exceeded; retry later")
+            reservation = self._runner.reserve()
+            if reservation is None:
+                raise EditableFileTaskCapacityError("Editable file task capacity exceeded; retry later")
+            try:
+                if base64_images:
+                    normalize_json_edit_images(images=base64_images)
+                now = _now_iso()
+                ts = time.time()
+                task, created = self._repository.create({
+                    "id": task_id,
+                    "storage_id": f"{EDITABLE_FILE_STORAGE_PREFIX}{new_uuid()}",
+                    "owner_id": owner,
+                    "status": TASK_STATUS_QUEUED,
+                    "kind": kind,
+                    "model": EDITABLE_FILE_MODEL,
+                    "created_at": now,
+                    "updated_at": now,
+                    "created_ts": ts,
+                    "updated_ts": ts,
+                })
+                if not created:
+                    return _public_task(task)
+                self._owner_pending[owner] = self._owner_pending.get(owner, 0) + 1
+                if not reservation.commit(
+                    self._run_admitted, owner, key, kind, prompt, base64_images, dict(identity), base_url,
+                    on_cancel=lambda exc: self._cancel_admitted(owner, key),
+                ):
+                    self._cancel_admitted(owner, key)
+                    raise EditableFileTaskCapacityError("Editable file task capacity unavailable")
                 return _public_task(task)
-        threading.Thread(target=self._run_task, args=(key, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
-        return _public_task(task)
+            finally:
+                reservation.rollback()
+
+    def start(self) -> None:
+        self._runner.start()
+
+    def shutdown(self) -> None:
+        self._runner.shutdown_cancel_pending_and_wait()
+
+    def _release_owner(self, owner: str) -> None:
+        with self._lock:
+            remaining = self._owner_pending.get(owner, 0) - 1
+            if remaining > 0:
+                self._owner_pending[owner] = remaining
+            else:
+                self._owner_pending.pop(owner, None)
+
+    def _cancel_admitted(self, owner: str, key: str) -> None:
+        try:
+            self._update_task(key, status=TASK_STATUS_ERROR, error="Task cancelled during shutdown", ended_ts=time.time())
+        finally:
+            self._release_owner(owner)
+
+    def _run_admitted(self, owner: str, *args: Any) -> None:
+        try:
+            self._run_task(*args)
+        finally:
+            self._release_owner(owner)
 
     def _run_task(self, key: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
         started = time.time()
