@@ -169,3 +169,200 @@ def test_idn_connection_uses_same_ascii_host_as_dns_pin(monkeypatch):
     assert calls[0][1]["curl_options"][CurlOpt.RESOLVE] == [
         "xn--bcher-kva.example:443:93.184.216.34"
     ]
+
+
+@pytest.mark.parametrize(
+    "path,handler",
+    [
+        ("/images/test.png", "get_image_response"),
+        ("/image-thumbnails/test.png", "get_thumbnail_response"),
+    ],
+)
+def test_public_image_preparation_does_not_block_other_requests(
+    monkeypatch, path, handler
+):
+    import asyncio
+    import threading
+    import httpx
+    from fastapi.responses import Response
+    from api import system
+    from api.app import create_app
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_image(_):
+        started.set()
+        release.wait(2)
+        return Response(b"image", media_type="image/png")
+
+    monkeypatch.setattr(system, handler, slow_image)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            task = asyncio.create_task(client.get(path))
+            try:
+                assert await asyncio.to_thread(started.wait, 3)
+                assert not task.done(), (
+                    "image preparation blocked the event loop until completion"
+                )
+                response = await asyncio.wait_for(client.get("/version"), 0.5)
+                assert response.status_code == 200
+            finally:
+                release.set()
+                response = await task
+            assert response.status_code == 200
+            assert response.content == b"image"
+
+    asyncio.run(scenario())
+
+
+def test_public_image_capacity_survives_request_cancellation(monkeypatch):
+    import asyncio
+    import threading
+    import httpx
+    from fastapi.responses import Response
+    from api import system
+    from api.app import create_app
+
+    release = threading.Event()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Queue()
+
+        def slow_image(_):
+            loop.call_soon_threadsafe(started.put_nowait, True)
+            release.wait(5)
+            return Response(b"image")
+
+        monkeypatch.setattr(system, "get_image_response", slow_image)
+        monkeypatch.setattr(system, "get_thumbnail_response", slow_image)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            tasks = [
+                asyncio.create_task(client.get("/images/test.png")) for _ in range(4)
+            ]
+            try:
+                for _ in tasks:
+                    await asyncio.wait_for(started.get(), 2)
+                response = await client.get("/image-thumbnails/test.png")
+                assert response.status_code == 429
+                assert response.headers["retry-after"] == "1"
+                assert (await client.get("/version")).status_code == 200
+                tasks[0].cancel()
+                await asyncio.gather(tasks[0], return_exceptions=True)
+                assert (await client.get("/images/test.png")).status_code == 429
+            finally:
+                release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # The cancelled request's worker may finish after the others; no
+            # worker remains blocked, so a normal request can now be admitted.
+            response = await client.get("/image-thumbnails/test.png")
+            assert response.status_code == 200
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "path", ["/images/missing.png", "/image-thumbnails/missing.png"]
+)
+def test_public_image_errors_release_capacity(monkeypatch, path):
+    import asyncio
+    import httpx
+    from api import system
+    from api.app import create_app
+
+    def missing(_):
+        raise HTTPException(status_code=404, detail="image not found")
+
+    monkeypatch.setattr(system, "get_image_response", missing)
+    monkeypatch.setattr(system, "get_thumbnail_response", missing)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            for _ in range(8):
+                assert (await client.get(path)).status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_public_images_serve_local_assets_and_thumbnails(tmp_path, monkeypatch):
+    import asyncio
+    import io
+    import httpx
+    from PIL import Image
+    from api.app import create_app
+    from services import image_service
+    from services.image_storage_service import ImageStorageService
+
+    class ImageConfig:
+        images_dir = tmp_path / "images"
+        image_thumbnails_dir = tmp_path / "thumbnails"
+        base_url = "http://test"
+
+        def get_image_storage_settings(self):
+            return {"mode": "local"}
+
+    import importlib
+
+    storage_module = importlib.import_module("services.image_storage_service")
+    monkeypatch.setattr(storage_module, "config", ImageConfig())
+    monkeypatch.setattr(image_service, "config", ImageConfig())
+    storage = ImageStorageService(tmp_path / "index.json")
+    monkeypatch.setattr(image_service, "image_storage_service", storage)
+    buf = io.BytesIO()
+    Image.new("RGB", (640, 480), "red").save(buf, format="PNG")
+    payload = buf.getvalue()
+    asset = storage.save(payload)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            response = await client.get("/images/" + asset.rel)
+            assert response.status_code == 200
+            assert response.content == payload
+            assert response.headers["content-type"] == "image/png"
+            for _ in range(2):
+                thumb = await client.get("/image-thumbnails/" + asset.rel)
+                assert thumb.status_code == 200
+                with Image.open(io.BytesIO(thumb.content)) as image:
+                    assert image.size == (320, 240)
+            assert (await client.get("/images/missing.png")).status_code == 404
+            assert (await client.get("/images/%2e%2e/config.json")).status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_thumbnail_reads_do_not_generate_same_file_twice(
+    monkeypatch, tmp_path
+):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from services import image_service
+
+    guard = threading.Lock()
+    active = 0
+    peak = 0
+
+    def prepare(_):
+        nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.03)
+        with guard:
+            active -= 1
+        return tmp_path / "thumbnail.png"
+
+    monkeypatch.setattr(image_service, "ensure_thumbnail", prepare)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(image_service.get_thumbnail_response, ["same.png"] * 4))
+    assert peak == 1

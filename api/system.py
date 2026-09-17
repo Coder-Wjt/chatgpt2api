@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from threading import BoundedSemaphore
 from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.call_contract import CallDetail, CallLogStatus, CallSummaryPage
@@ -80,6 +84,36 @@ from services.settings_management_service import (
 )
 from services.update_status_service import update_status_service
 from services.update_service import UpdateInstallError, update_service
+
+
+_PUBLIC_IMAGE_WORKERS = 4
+_public_image_slots = BoundedSemaphore(_PUBLIC_IMAGE_WORKERS)
+_public_image_executor = ThreadPoolExecutor(
+    max_workers=_PUBLIC_IMAGE_WORKERS, thread_name_prefix="public-image"
+)
+
+
+async def _prepare_public_image(
+    prepare: Callable[[str], Response], image_path: str
+) -> Response:
+    # Reject before submission: the executor's queue must not become an
+    # unbounded backlog, and image work must not consume API worker threads.
+    if not _public_image_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many active image reads; retry later",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        future = _public_image_executor.submit(prepare, image_path)
+    except BaseException:
+        _public_image_slots.release()
+        raise
+    # Cancellation of an HTTP coroutine cannot stop a running synchronous read.
+    # Release only when the underlying work actually finishes (or is cancelled
+    # before starting), not when the awaiting request disconnects.
+    future.add_done_callback(lambda _: _public_image_slots.release())
+    return await asyncio.wrap_future(future)
 
 
 class ProxyTestRequest(BaseModel):
@@ -295,11 +329,11 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        return await _prepare_public_image(get_image_response, image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
-        return get_thumbnail_response(image_path)
+        return await _prepare_public_image(get_thumbnail_response, image_path)
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):

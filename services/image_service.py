@@ -20,6 +20,8 @@ from services.image_storage_service import (
 from services.image_tags_service import load_tags, remove_tags
 
 THUMBNAIL_SIZE = (320, 320)
+# Fixed stripes avoid an unbounded lock registry for public, user-supplied paths.
+_THUMBNAIL_LOCKS = tuple(threading.Lock() for _ in range(16))
 
 
 def _cleanup_empty_dirs(root: Path) -> None:
@@ -94,7 +96,10 @@ def get_thumbnail_response(relative_path: str) -> FileResponse:
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "*",
     }
-    return FileResponse(ensure_thumbnail(relative_path), headers=headers)
+    rel = normalize_image_relative_path(relative_path)
+    with _THUMBNAIL_LOCKS[hash(rel) % len(_THUMBNAIL_LOCKS)]:
+        path = ensure_thumbnail(rel)
+    return FileResponse(path, headers=headers)
 
 
 def get_image_download_response(relative_path: str) -> FileResponse:
