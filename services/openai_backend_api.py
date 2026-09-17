@@ -3791,8 +3791,8 @@ class OpenAIBackendAPI:
         )
         route = "/backend-api/models" if self.access_token else "/backend-anon/models"
         context = "auth_models" if self.access_token else "anon_models"
-        response = self.session.get(
-            self.base_url + path,
+        response = self._chat_request(
+            "models", "GET", self.base_url + path,
             headers=self._headers(route),
             timeout=30,
         )

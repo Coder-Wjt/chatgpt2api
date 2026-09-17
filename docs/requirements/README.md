@@ -29,7 +29,7 @@ requirements may move to `archive/` after links and this index are updated.
 
 ## Active requirements
 
-No active PRDs are currently tracked.
+- [0001: Account-scoped model discovery](0001-account-model-discovery.md) — pending-verification.
 
 PRDs are planning evidence, never proof that the product already behaves as
 described.

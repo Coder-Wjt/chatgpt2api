@@ -3,15 +3,15 @@ set -eu
 
 seed_root=/opt/chatgpt2api
 runtime_root=/app
-marker_name=.chatgpt2api-image-version
-seed_version="$(tr -d '\r\n' < "${seed_root}/VERSION")"
-installed_image_version=""
+marker_name=.chatgpt2api-image-build
+seed_build="$(tr -d '\r\n' < /opt/chatgpt2api-build-id)"
+installed_image_build=""
 
 if [ -f "${runtime_root}/${marker_name}" ]; then
-  installed_image_version="$(tr -d '\r\n' < "${runtime_root}/${marker_name}")"
+  installed_image_build="$(tr -d '\r\n' < "${runtime_root}/${marker_name}")"
 fi
 
-if [ ! -f "${runtime_root}/VERSION" ] || [ "${installed_image_version}" != "${seed_version}" ]; then
+if [ ! -f "${runtime_root}/VERSION" ] || [ "${installed_image_build}" != "${seed_build}" ]; then
   mkdir -p "${runtime_root}"
   find "${runtime_root}" -mindepth 1 -maxdepth 1 \
     ! -name data \
@@ -27,7 +27,7 @@ if [ ! -f "${runtime_root}/VERSION" ] || [ "${installed_image_version}" != "${se
   done
 
   marker_tmp="${runtime_root}/${marker_name}.tmp"
-  printf '%s\n' "${seed_version}" > "${marker_tmp}"
+  printf '%s\n' "${seed_build}" > "${marker_tmp}"
   mv "${marker_tmp}" "${runtime_root}/${marker_name}"
 fi
 

@@ -15,7 +15,7 @@ test -f config.json || printf '{}\n' > config.json
 docker compose up -d
 ```
 
-镜像中的 `/opt/chatgpt2api` 是只读应用种子，`/app` 是受管运行目录。首次启动或镜像版本变化时，入口脚本会用镜像种子刷新 `/app`，再按锁文件同步 Python 依赖；同一镜像正常重启时会保留控制台在线更新后的运行版本。业务数据始终留在独立的 `data/` 挂载中。
+镜像中的 `/opt/chatgpt2api` 是只读应用种子，`/app` 是受管运行目录。首次启动或镜像构建指纹变化时，入口脚本会用镜像种子刷新 `/app`，再按锁文件同步 Python 依赖；同一镜像正常重启时会保留控制台在线更新后的运行版本。构建指纹写在镜像的 `/opt/chatgpt2api-build-id`，已安装指纹记录在运行目录的 `.chatgpt2api-image-build`；即使 VERSION 未变，新构建的代码也会触发刷新。业务数据始终留在独立的 `data/` 挂载中。
 
 ### Nginx HTTPS 上线
 
@@ -42,7 +42,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --force-r
 ```
 
 本地 PostgreSQL 部署须在上述两条命令中同时保留 `-f docker-compose.postgres.yml`。
-构建 overlay 使用匿名 `/app` 运行卷，`--renew-anon-volumes` 保证每次从新镜像初始化代码，避免同版本旧运行卷遮蔽安全修复。业务数据仍在独立挂载中。
+构建 overlay 使用匿名 `/app` 运行卷，`--renew-anon-volumes` 保证每次从新镜像初始化代码，避免旧运行卷遮蔽安全修复。业务数据仍在独立挂载中。
 不要删除数据库卷；保留旧镜像及备份作为回滚来源。上线后验证 `/version`、未授权 `/v1/models` 返回 401、登录和 SSE 正常，并确认公网无法直连源站端口。
 
 ### 本地 PostgreSQL 18
@@ -123,6 +123,12 @@ npm run dev
 SQLite 文件。图片文件及其相关索引仍按图片存储边界管理。完整边界见
 [`storage-architecture.md`](storage-architecture.md)。
 
+## 模型目录缓存
+
+`/v1/models` 和控制台按可用账号查询上游模型，保留 `auto` 和本项目图片模型别名。显式配置聊天模型列表时优先使用配置。缓存为进程内状态：成功结果缓存 5 分钟，失败后至少等待 60 秒重试，旧成功结果最多保留 1 小时；重启后重新获取。
+
+首次请求最多等待 1 秒，没有可用结果时返回内置聊天模型，后台最多并发查询 2 个账号；稍后再次调用模型列表可取得刷新结果。禁用或删除账号后，下次查询会移除该账号的缓存贡献。列表代表账号池发现的模型并集，不承诺每个账号都有所有模型权限；本次未改变聊天请求的账号选择策略。
+
 ## 升级
 
 升级前先在系统设置中执行一次 R2 备份，并确认状态为成功。备份归档始终包含
@@ -178,7 +184,7 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml pull
 docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 ```
 
-镜像部署固定或回退版本时，在 `.env` 设置 `CHATGPT2API_IMAGE=ghcr.io/yukkcat/chatgpt2api:<tag>`，再执行对应的 `pull` 与 `up`。镜像版本变化后，入口脚本会用该镜像刷新受管运行目录；Git 检出标签只影响源码运行，不会改变 Compose 使用的镜像版本。升级后检查：
+镜像部署固定或回退版本时，在 `.env` 设置 `CHATGPT2API_IMAGE=ghcr.io/yukkcat/chatgpt2api:<tag>`，再执行对应的 `pull` 与 `up`。镜像构建指纹变化后，入口脚本会用该镜像刷新受管运行目录；Git 检出标签只影响源码运行，不会改变 Compose 使用的镜像版本。升级后检查：
 
 ```bash
 docker compose ps

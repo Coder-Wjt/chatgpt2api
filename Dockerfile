@@ -65,6 +65,9 @@ COPY --from=image-upscale-build /app/scripts/image_upscale/node_modules ./script
 COPY --from=web-build /app/web-vue/dist ./web_dist
 COPY deploy/docker-entrypoint.sh /usr/local/bin/chatgpt2api-entrypoint
 RUN chmod 0755 /usr/local/bin/chatgpt2api-entrypoint
+RUN find main.py VERSION pyproject.toml uv.lock api contracts services utils scripts web_dist \
+    -type f ! -path '*/node_modules/*' ! -path '*/__pycache__/*' -print0 \
+    | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1 > /opt/chatgpt2api-build-id
 
 WORKDIR /app
 

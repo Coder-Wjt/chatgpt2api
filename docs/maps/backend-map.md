@@ -23,9 +23,23 @@ second implementation of service state transitions.
 
 ### Model catalog and image compatibility
 
-`ModelCatalogService` defaults chat models to `gpt-5.6` and `auto` and retains
-explicit configured overrides. The console and `/v1/models` consume the same
-catalog; listing models does not query upstream or append upstream-only entries.
+`ModelCatalogService` owns account-scoped upstream model discovery and its
+in-memory cache. It applies the text-account eligibility rule, refreshes credentials
+through `AccountService`, and queries `OpenAIBackendAPI.list_models` using each
+account's proxy routing. The console and `/v1/models` share the deduplicated union
+plus `auto`; explicit configured chat lists still take precedence. Source `accounts`
+means a usable account-derived snapshot, including a bounded stale snapshot.
+
+Refresh is demand-driven, single-flight, and limited to two workers participating
+in the shared account-processing limiter. Fresh snapshots last five minutes;
+failures retry after one minute and may retain a successful snapshot for at most
+one hour. With no usable snapshot, a request waits at most one second for discovery
+before returning `gpt-5.6` and `auto`. Disabled/deleted accounts and changed token,
+plan, or explicit proxy keys lose their old catalog contribution on the next view.
+Application shutdown stops pending discovery and waits for active work. Restart
+starts with no persisted model cache. The model list is discovery metadata; text
+execution retains its existing account-selection policy, so inclusion does not
+guarantee that every account can execute every listed model.
 
 `utils.helper.WEB_IMAGE_MODELS` owns the built-in Web image identifiers:
 `gpt-image-2`, `gpt-image-2.5`, `gpt-image-2.5-flare`, and

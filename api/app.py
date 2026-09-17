@@ -17,6 +17,7 @@ from api.support import resolve_web_asset, start_account_lifecycle_watcher
 from services.account_service import account_service
 from services.backup_service import backup_service
 from services.config import config
+from services.model_catalog_service import model_catalog_service
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.genbox_push_service import (
     shutdown_genbox_push_service,
@@ -53,6 +54,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _configure_threadpool()
+        model_catalog_service.start()
         start_genbox_push_service()
         image_task_service.start()
         editable_file_task_service.start()
@@ -101,6 +103,7 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            await run_in_threadpool(model_catalog_service.shutdown)
             thread.join(timeout=1)
             dashboard_metrics_thread.join(timeout=1)
             await run_in_threadpool(cleanup_thread.join, RETENTION_SHUTDOWN_TIMEOUT_SECS)
