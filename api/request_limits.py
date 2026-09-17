@@ -19,6 +19,11 @@ from services.protocol.error_response import (
 
 MAX_REQUEST_BYTES = 150 * 1024 * 1024
 MAX_BODY_REQUESTS = 8
+SMALL_BODY_BYTES = 1024 * 1024
+ACTIVE_REQUEST_LIMITS = {"chat": 250, "image": 8, "write": 8}
+CHAT_PATHS = frozenset({
+    "/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/search",
+})
 
 
 class RequestLimitsMiddleware:
@@ -26,6 +31,7 @@ class RequestLimitsMiddleware:
         self.app = app
         self.max_bytes = max_bytes
         self._body_requests = 0
+        self._active_requests = dict.fromkeys(ACTIVE_REQUEST_LIMITS, 0)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope["method"] not in {
@@ -79,12 +85,24 @@ class RequestLimitsMiddleware:
                 )
             await response(scope, receive, send)
             return
-        if self._body_requests >= MAX_BODY_REQUESTS:
+        pool = "write"
+        if scope["method"] == "POST":
+            if path in CHAT_PATHS:
+                pool = "chat"
+            elif path in {"/v1/images/generations", "/v1/images/edits"} or path.startswith("/api/image-tasks/"):
+                pool = "image"
+        if self._active_requests[pool] >= ACTIVE_REQUEST_LIMITS[pool]:
             await reject(429, "Too many active requests; retry later")
             return
+        if self._body_requests >= MAX_BODY_REQUESTS:
+            await reject(429, "Too many active uploads; retry later")
+            return
+        self._active_requests[pool] += 1
         self._body_requests += 1
-        spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+        uploading = True
+        spool = None
         try:
+            spool = tempfile.SpooledTemporaryFile(max_size=SMALL_BODY_BYTES)
             total = 0
             try:
                 async with asyncio.timeout(60):
@@ -104,6 +122,11 @@ class RequestLimitsMiddleware:
                 await reject(408, "Request body upload timed out")
                 return
             spool.seek(0)
+            # Small uploads release capacity before execution. Large bodies keep
+            # it through response completion to bound concurrent parsing/memory.
+            if total <= SMALL_BODY_BYTES:
+                self._body_requests -= 1
+                uploading = False
             remaining = total
             delivered = False
 
@@ -125,5 +148,10 @@ class RequestLimitsMiddleware:
 
             await self.app(scope, replay, send)
         finally:
-            spool.close()
-            self._body_requests -= 1
+            try:
+                if spool is not None:
+                    spool.close()
+            finally:
+                if uploading:
+                    self._body_requests -= 1
+                self._active_requests[pool] -= 1

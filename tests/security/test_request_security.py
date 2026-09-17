@@ -284,3 +284,132 @@ def test_authenticated_capacity_and_cancellation_cleanup():
         assert middleware._body_requests == 0
 
     asyncio.run(scenario())
+
+
+def test_active_request_pools_are_independent_and_hold_until_response_end():
+    async def scenario():
+        entered = asyncio.Queue()
+        release = asyncio.Event()
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await entered.put(True)
+            await release.wait()
+            await send({'type': 'http.response.body', 'body': b'', 'more_body': False})
+
+        middleware = RequestLimitsMiddleware(app)
+        tasks = []
+
+        async def request(path):
+            responses = []
+            async def receive():
+                return {'type': 'http.request', 'body': b'{}', 'more_body': False}
+            async def send(message):
+                responses.append(message)
+            await middleware({'type': 'http', 'method': 'POST', 'path': path,
+                              'headers': [(b'authorization', f'Bearer {config.auth_key}'.encode())]}, receive, send)
+            return responses
+
+        async def admit(path):
+            task = asyncio.create_task(request(path))
+            tasks.append(task)
+            waiter = asyncio.create_task(entered.get())
+            done, _ = await asyncio.wait([task, waiter], timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            if waiter not in done:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+                pytest.fail(f'request rejected before pool capacity: {path}')
+
+        try:
+            chat_paths = ['/v1/chat/completions', '/v1/responses', '/v1/messages', '/v1/search']
+            for i in range(250):
+                await admit(chat_paths[i % len(chat_paths)])
+            for path in chat_paths:
+                assert (await request(path))[0]['status'] == 429
+            for _ in range(8):
+                await admit('/v1/images/generations')
+            for path in ['/v1/images/edits', '/api/image-tasks/generations', '/api/image-tasks/edits', '/api/image-tasks/example/resume-poll']:
+                assert (await request(path))[0]['status'] == 429
+            for _ in range(8):
+                await admit('/api/settings')
+            assert (await request('/auth/login'))[0]['status'] == 429
+            # Cancellation frees only the affected pool, even after response headers.
+            tasks[0].cancel()
+            await asyncio.gather(tasks[0], return_exceptions=True)
+            await admit('/v1/chat/completions')
+            assert (await request('/api/settings'))[0]['status'] == 429
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for path in ['/v1/chat/completions', '/v1/images/generations', '/api/settings']:
+                assert (await request(path))[0]['status'] == 200
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_large_chat_bodies_keep_upload_capacity_until_response_finishes():
+    async def scenario():
+        entered = asyncio.Queue()
+        async def app(scope, receive, send):
+            await entered.put(True)
+            await asyncio.Event().wait()
+        middleware = RequestLimitsMiddleware(app)
+        async def request():
+            responses = []
+            async def receive():
+                return {'type': 'http.request', 'body': b'x' * (1024 * 1024 + 1), 'more_body': False}
+            async def send(message):
+                responses.append(message)
+            await middleware({'type': 'http', 'method': 'POST', 'path': '/v1/chat/completions',
+                              'headers': [(b'authorization', f'Bearer {config.auth_key}'.encode())]}, receive, send)
+            return responses
+        tasks = []
+        try:
+            for _ in range(8):
+                tasks.append(asyncio.create_task(request()))
+                await asyncio.wait_for(entered.get(), timeout=5)
+            ninth = asyncio.create_task(request())
+            tasks.append(ninth)
+            responses = await asyncio.wait_for(ninth, timeout=1)
+            assert responses[0]['status'] == 429
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        assert middleware._body_requests == 0
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['disconnect', 'oversize', 'endpoint', 'spool'])
+def test_request_capacity_is_released_on_failure(failure, monkeypatch):
+    import api.request_limits as limits
+
+    async def scenario():
+        async def app(scope, receive, send):
+            if failure == 'endpoint':
+                raise RuntimeError('endpoint failed')
+        middleware = RequestLimitsMiddleware(app, max_bytes=4)
+        scope = {'type': 'http', 'method': 'POST', 'path': '/v1/chat/completions',
+                 'headers': [(b'authorization', f'Bearer {config.auth_key}'.encode())]}
+        async def receive():
+            if failure == 'disconnect':
+                return {'type': 'http.disconnect'}
+            return {'type': 'http.request', 'body': b'12345' if failure == 'oversize' else b'{}', 'more_body': False}
+        async def send(message):
+            pass
+        if failure == 'spool':
+            def fail_spool(*args, **kwargs):
+                raise OSError('temporary storage unavailable')
+            monkeypatch.setattr(limits.tempfile, 'SpooledTemporaryFile', fail_spool)
+        if failure in {'spool', 'endpoint'}:
+            with pytest.raises((OSError, RuntimeError)):
+                await middleware(scope, receive, send)
+        else:
+            await middleware(scope, receive, send)
+        assert middleware._body_requests == 0
+        assert not any(middleware._active_requests.values())
+    asyncio.run(scenario())
