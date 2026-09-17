@@ -25,7 +25,7 @@ docker compose up -d
 示例配置位于 Nginx 的 `http` 上下文，提供 HTTPS、150 MiB 请求上限、每 IP 速率与连接数限制，并关闭响应缓冲以支持 SSE。
 如果 Nginx 自身在容器内，应让它和应用共用私有 Docker 网络，并将 `proxy_pass` 改为应用服务名；容器里的 `127.0.0.1` 不是宿主机。不要为了反代而直接开放源站公网端口。
 
-应用在 JSON/multipart 解析前校验实际请求字节数，包括无 Content-Length 和伪造长度的请求。
+应用先检查 Content-Length 是否超过上限，再对 POST/PUT/PATCH/DELETE 请求校验密钥；缺失或无效密钥返回 401，不读取正文、不占用写请求槽位。`/v1/messages` 兼容 `x-api-key`，其他写接口使用 Bearer 密钥；端点仍执行管理员权限和资源归属校验。已认证请求在 JSON/multipart 解析前校验实际请求字节数，包括无 Content-Length 和伪造长度的请求。
 单请求最多 150 MiB，上传总时间最多 60 秒；每进程最多同时处理 8 个带请求体的写请求，SSE 在响应结束时释放容量；GET/HEAD 查询不占用该容量。
 超出大小返回 413，容量不足返回 429，上传超时返回 408。图片编辑仍限制单图 50 MiB、合计 100 MiB、最多 16 张；聊天参考图每张 10 MiB，整段对话最多 10 张。
 PPT/PSD 默认 2 个执行槽、4 个排队槽，每个 User Key 最多 2 个未完成任务，容量不足返回 429；重复 client_task_id 返回原任务。

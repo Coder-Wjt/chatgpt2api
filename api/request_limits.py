@@ -5,9 +5,17 @@ from __future__ import annotations
 import asyncio
 import tempfile
 
+from fastapi import HTTPException
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from fastapi.concurrency import run_in_threadpool
+
+from api.support import require_identity
+from services.protocol.error_response import (
+    anthropic_error_response,
+    openai_error_response,
+)
 
 MAX_REQUEST_BYTES = 150 * 1024 * 1024
 MAX_BODY_REQUESTS = 8
@@ -47,6 +55,30 @@ class RequestLimitsMiddleware:
                 if size > self.max_bytes:
                     await reject(413, "Request body exceeds 150 MiB limit")
                     return
+        # No write endpoint accepts anonymous bodies. Authenticate before reserving
+        # capacity or touching receive(); endpoint role/ownership checks still apply.
+        headers = Headers(scope=scope)
+        path = scope.get("path", "")
+        authorization = headers.get("authorization")
+        if path == "/v1/messages" and not authorization:
+            api_key = headers.get("x-api-key")
+            authorization = f"Bearer {api_key}" if api_key else None
+        try:
+            if authorization:
+                await run_in_threadpool(require_identity, authorization)
+            else:
+                require_identity(None)
+        except HTTPException as exc:
+            if path == "/v1/messages":
+                response = anthropic_error_response(exc.detail, exc.status_code)
+            elif path == "/v1" or path.startswith("/v1/"):
+                response = openai_error_response(exc.detail, exc.status_code)
+            else:
+                response = JSONResponse(
+                    {"detail": exc.detail}, status_code=exc.status_code
+                )
+            await response(scope, receive, send)
+            return
         if self._body_requests >= MAX_BODY_REQUESTS:
             await reject(429, "Too many active requests; retry later")
             return
