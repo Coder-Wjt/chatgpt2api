@@ -7,8 +7,6 @@ import re
 import threading
 import time
 
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
@@ -959,7 +957,7 @@ class OpenAIBackendAPI:
     @staticmethod
     def _iter_codex_response_events(raw: Any, max_duration_secs: float | None = None) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        status_code = getattr(raw, "status", None)
+        status_code = raw.status_code
         timeout_secs = float(max_duration_secs or 0)
         started_at = time.monotonic()
         timed_out = False
@@ -989,29 +987,6 @@ class OpenAIBackendAPI:
             body_parts.append(chunk)
             body_preview_len += len(chunk)
 
-        def _flush_sse_event(lines: list[str]) -> bool:
-            if not lines:
-                return False
-            payload_text = "\n".join(lines).strip()
-            lines.clear()
-            if not payload_text:
-                return False
-            if payload_text == "[DONE]":
-                return True
-            try:
-                data = json.loads(payload_text)
-            except Exception as exc:
-                parse_errors.append(str(exc))
-                return False
-            if isinstance(data, dict):
-                events.append(data)
-                return str(data.get("type") or "") in {
-                    "response.completed",
-                    "response.failed",
-                    "response.incomplete",
-                }
-            return False
-
         if timeout_secs > 0:
             timer = threading.Timer(timeout_secs, _abort_stream)
             timer.daemon = True
@@ -1019,7 +994,7 @@ class OpenAIBackendAPI:
         try:
             if "application/json" in content_type:
                 _raise_if_timeout()
-                text = raw.read().decode("utf-8", "replace")
+                text = b"".join(raw.iter_content()).decode("utf-8", "replace")
                 _raise_if_timeout()
                 _append_body(text)
                 try:
@@ -1029,25 +1004,19 @@ class OpenAIBackendAPI:
                 except Exception as exc:
                     parse_errors.append(str(exc))
             else:
-                lines: list[str] = []
-                while True:
-                    _raise_if_timeout()
-                    raw_line = raw.readline()
-                    _raise_if_timeout()
-                    if not raw_line:
-                        break
-                    line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
-                    _append_body(line + "\n")
-                    if not line:
-                        if _flush_sse_event(lines):
+                for payload_text in iter_sse_payloads(raw, max_duration_secs=timeout_secs):
+                    _append_body(payload_text + "\n")
+                    try:
+                        data = json.loads(payload_text)
+                    except Exception as exc:
+                        parse_errors.append(str(exc))
+                        continue
+                    if isinstance(data, dict):
+                        events.append(data)
+                        if str(data.get("type") or "") in {
+                            "response.completed", "response.failed", "response.incomplete",
+                        }:
                             break
-                    elif line.startswith("data:"):
-                        data_line = line[5:].lstrip()
-                        if data_line == "[DONE]":
-                            lines.clear()
-                            break
-                        lines.append(data_line)
-                _flush_sse_event(lines)
                 _raise_if_timeout()
         except Exception as exc:
             if timed_out and timeout_secs > 0 and not isinstance(exc, TimeoutError):
@@ -1110,12 +1079,6 @@ class OpenAIBackendAPI:
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
         account = account_service.get_account(self.access_token) or {}
         token_payload = account_service._decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
@@ -1124,7 +1087,7 @@ class OpenAIBackendAPI:
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
-            "transport": "urllib.request",
+            "transport": "curl_cffi",
             "timeout_secs": config.image_stream_timeout_secs,
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
@@ -1158,20 +1121,24 @@ class OpenAIBackendAPI:
             },
         })
         stream_timeout = config.image_stream_timeout_secs
+        response = self._chat_request(
+            "codex_responses", "POST", self.base_url + path,
+            headers=self._codex_responses_headers(),
+            json=payload,
+            timeout=stream_timeout,
+            stream=True,
+        )
         try:
-            with urllib.request.urlopen(request, timeout=stream_timeout) as raw:
-                yield from self._iter_codex_response_events(raw, max_duration_secs=stream_timeout)
-        except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
-            body: Any = body_text
             try:
-                body = json.loads(body_text)
-            except Exception:
-                pass
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+                ensure_ok(response, path)
+            except UpstreamHTTPError as error:
+                self._log_codex_response_failure(
+                    path, error.status_code, response.headers, payload, error.body,
+                )
+                raise
+            yield from self._iter_codex_response_events(response, max_duration_secs=stream_timeout)
+        finally:
+            response.close()
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""

@@ -21,6 +21,10 @@
 
 这些字段都只是解析事实。`tool_invoked=true` 或 `async_task_type=image_gen` 说明可能需要继续解析或补查，但本身不等于图片已经成功生成。
 
+## Codex 图片传输
+
+Codex 图片响应通过 `OpenAIBackendAPI` 已配置的 curl_cffi Session 请求 `/backend-api/codex/responses`，复用账号、账号组优先及全局默认兜底的出口选择；图片重试传入备用代理配置时沿用该出口。SSE 复用共享解析器，保留 Codex 终态事件判定；HTTP 错误保留状态码、限量正文与 `Retry-After`。
+
 ## 图片成功判定
 
 图片成功必须得到可用的输出资产。Conversation SSE 只会从受信任的工具消息和 patch 上下文收集有效的 `file_` / `sediment://` 输出指针，随后由后端解析和下载资源；仅仅看到输入附件或工具信号不能当作输出图片。`data:image/...`、base64 或直接结果 URL 属于独立的 Codex 图片响应路径，不能当作一般 Conversation SSE 的结果规则。
