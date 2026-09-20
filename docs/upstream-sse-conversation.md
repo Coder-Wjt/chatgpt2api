@@ -21,6 +21,8 @@
 
 这些字段都只是解析事实。`tool_invoked=true` 或 `async_task_type=image_gen` 说明可能需要继续解析或补查，但本身不等于图片已经成功生成。
 
+普通文本流可能先返回 `resume_conversation_token` 和 `stream_handoff`，而没有消息正文。`OpenAIBackendAPI.stream_conversation` 在上游提供 `resume_sse_endpoint` 时，以同一 Session、账号和代理向 `/backend-api/f/conversation/resume`（匿名路径为 `/backend-anon/f/conversation/resume`）发送 `conversation_id` 与 `offset: 0`，并在 `x-conduit-token` 请求头携带续接凭据。第一段交接流的 `[DONE]` 不代表回答完成；续接流重放的控制事件被消费，不会循环续接或重新提交用户消息。续接凭据不传入业务解析器或日志，缺失或不匹配的交接信息返回受控错误。首段对话请求和续接共用 300 秒预算，结束、异常及取消时关闭响应。
+
 ## Codex 图片传输
 
 Codex 图片响应通过 `OpenAIBackendAPI` 已配置的 curl_cffi Session 请求 `/backend-api/codex/responses`，复用账号、账号组优先及全局默认兜底的出口选择；图片重试传入备用代理配置时沿用该出口。SSE 复用共享解析器，保留 Codex 终态事件判定；HTTP 错误保留状态码、限量正文与 `Retry-After`。
@@ -32,6 +34,10 @@ Codex 图片响应通过 `OpenAIBackendAPI` 已配置的 curl_cffi Session 请�
 SSE 未携带完整结果时，后端会根据已有的 `conversation_id`、任务事实和流状态继续读取会话或图片任务，再决定是否有输出资产、文本结果或失败。这个补查过程属于后端协议层；Studio 和其他页面不自行轮询上游 Conversation。
 
 ## 文本、JSON 和失败
+
+普通文本调用通过共享的 `stream_text_deltas` 处理 Chat Completions、Responses 和 Messages 请求。`-wm` 工作模式在初次选择及鉴权重试时跳过已知免费账号；未知订阅类型仍由上游判定，不能仅凭付费类型保证模型可用。没有合适账号时返回 `no_available_account`（503）。
+
+文本调用使用 `TextGenerationError` 输出 HTTP/SSE 错误和调用记录。上游 `work_subscription_required` 保留为订阅权限错误（403），不作为失效凭据触发鉴权重试。HTTP 200 的 SSE 内结构化错误同样会被检查；流结束但没有任何文本增量时返回 `empty_upstream_response`（502），不会生成正常结束结果或记录为成功。已经输出文本后发生错误时发送流式错误，不切换账号重放内容。
 
 没有有效图片资产时，终态 assistant 的普通文本 / 代码内容会分类为 `upstream_text_reply`，按 HTTP 400 的图片文本结果返回。它不是账号失败，也不会触发账号切换。
 

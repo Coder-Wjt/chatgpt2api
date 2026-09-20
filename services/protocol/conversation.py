@@ -41,6 +41,7 @@ from services.image_failure import (
 from services.image_storage_service import image_storage_service
 from services.image_upscale_service import upscale_image_if_needed
 from services.openai_backend_api import OpenAIBackendAPI
+from services.protocol.error_response import TextGenerationError
 from services.proxy_service import ImageEgressDeadlineError, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
@@ -54,7 +55,7 @@ from utils.helper import (
 )
 from utils.image_tokens import count_image_content_tokens, image_output_metadata, image_size_from_bytes
 from utils.log import logger
-from utils.diagnostics import diagnostic_excerpt
+from utils.diagnostics import diagnostic_excerpt, sanitize_diagnostic_text
 
 
 def _monitor_image_stage(request: "ConversationRequest", event: str, **data: Any) -> None:
@@ -1095,8 +1096,15 @@ def _remember_text_account(backend: OpenAIBackendAPI, access_token: str) -> str:
     return email
 
 
-def text_backend() -> OpenAIBackendAPI:
-    access_token = account_service.get_text_access_token()
+def text_backend(model: str = "auto") -> OpenAIBackendAPI:
+    access_token = account_service.get_text_access_token(model=model)
+    if not access_token:
+        if model.endswith("-wm"):
+            raise TextGenerationError(
+                "No eligible account is available for this work-mode model. Use auto or add an account with a supported paid subscription.",
+                "no_available_account", 503,
+            )
+        raise TextGenerationError("No available text account.", "no_available_account", 503)
     backend = OpenAIBackendAPI(access_token=access_token)
     _remember_text_account(backend, access_token)
     return backend
@@ -1126,18 +1134,34 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 thinking_effort=request.thinking_effort,
             ):
                 structured_failure = event.get("_image_failure")
+                raw = event.get("raw")
+                if isinstance(raw, dict) and raw.get("error"):
+                    status = structured_failure.status_code if isinstance(structured_failure, ImageFailure) else 502
+                    raise TextGenerationError.from_detail(raw, status)
                 if isinstance(structured_failure, ImageFailure):
-                    raise ImageFailureError(failure=structured_failure)
+                    raise TextGenerationError(
+                        "Upstream text generation failed.",
+                        "upstream_error" if structured_failure.code.startswith("image_") else structured_failure.code,
+                        structured_failure.status_code,
+                    )
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
                     emitted = True
                     yield delta
+            if not emitted:
+                raise TextGenerationError(
+                    "Upstream returned no text. Please retry or choose another model.",
+                    "empty_upstream_response",
+                )
             account_service.mark_text_used(token)
             return
         except Exception as exc:
-            auth_failure = bool(token and _is_account_auth_failure(exc))
+            auth_failure = bool(token and (
+                (isinstance(exc, TextGenerationError) and exc.status_code == 401)
+                or (not isinstance(exc, TextGenerationError) and _is_account_auth_failure(exc))
+            ))
             if auth_failure:
                 try:
                     account_service.schedule_auth_verification(
@@ -1159,9 +1183,20 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     })
                 auth_failures += 1
             if auth_failure and not emitted and auth_failures < 2:
-                token = account_service.get_text_access_token(attempted_tokens)
-                if token:
+                next_token = account_service.get_text_access_token(attempted_tokens, model=request.model)
+                if next_token:
+                    token = next_token
                     continue
+            if not isinstance(exc, TextGenerationError):
+                if isinstance(exc, UpstreamHTTPError):
+                    error = TextGenerationError.from_detail(exc.body, exc.status_code)
+                else:
+                    error = TextGenerationError("Upstream text generation failed.")
+                setattr(error, "upstream_error", sanitize_diagnostic_text(
+                    exc, sensitive_values=[token], limit=4000,
+                ))
+                setattr(error, "account_email", _text_account_email(token))
+                raise error from exc
             if token and not getattr(exc, "account_email", ""):
                 setattr(exc, "account_email", _text_account_email(token))
             raise

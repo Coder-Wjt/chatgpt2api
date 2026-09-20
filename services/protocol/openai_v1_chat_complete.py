@@ -334,7 +334,7 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
 
 
 def text_completion_response(model: str, messages: list[dict[str, Any]], thinking_effort: str) -> dict[str, Any]:
-    backend = text_backend()
+    backend = text_backend(model)
     response = completion_response(
         model,
         collect_text(backend, ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
@@ -354,7 +354,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
+            lambda: stream_text_chat_completion(text_backend(model), messages, model, thinking_effort),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)

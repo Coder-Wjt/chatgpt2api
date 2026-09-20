@@ -23,7 +23,7 @@ from services.image_failure import (
     is_text_review_failure_code,
     public_image_error_message,
 )
-from services.protocol.error_response import anthropic_error_response, openai_error_response
+from services.protocol.error_response import TextGenerationError, anthropic_error_response, openai_error_response
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.diagnostics import (
     diagnostic_excerpt,
@@ -403,6 +403,9 @@ def _request_full_text(text: object, limit: int = REQUEST_TEXT_FULL_LIMIT) -> tu
 
 def _exception_log_fields(exc: Exception, *, image: bool = False) -> dict[str, object]:
     fields = exception_diagnostic_fields(exc, include_status_code=True)
+    if isinstance(exc, TextGenerationError):
+        fields["public_error"] = exc.public_error
+        return fields
     attempts = collect_image_attempts(exc)
     if attempts:
         fields["image_attempts"] = attempts
@@ -454,7 +457,9 @@ def _image_error_response(exc: Exception) -> JSONResponse:
 
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
-    message = str(exc)
+    message = exc.to_openai_error() if isinstance(exc, TextGenerationError) else str(exc)
+    if isinstance(exc, TextGenerationError):
+        status_code = exc.status_code
     if sse == "anthropic":
         return anthropic_error_response(message, status_code)
     return openai_error_response(message, status_code)

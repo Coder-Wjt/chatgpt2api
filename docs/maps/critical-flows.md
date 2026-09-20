@@ -73,6 +73,13 @@ not task truth.
 
 ## Call Record, live monitor, and metrics
 
+For text calls, protocol adapters share `stream_text_deltas`, which consumes
+`OpenAIBackendAPI.stream_conversation`. The transport owns upstream SSE handoff
+and resumption using the same Session and time budget; protocol adapters see one
+continuous payload stream. See the [upstream protocol reference](../upstream-sse-conversation.md)
+for the handoff contract. `TextGenerationError` carries text failure details to
+HTTP/SSE responses and `LoggedCall`; an empty text stream is not a successful call.
+
 ```mermaid
 sequenceDiagram
     participant Route as Public API route

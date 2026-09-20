@@ -3,6 +3,33 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi.responses import JSONResponse
+from utils.diagnostics import sanitize_diagnostic_text
+
+
+class TextGenerationError(RuntimeError):
+    """Text-call failure shared by HTTP, SSE and call-record projections."""
+
+    def __init__(self, message: str, code: str = "upstream_error", status_code: int = 502) -> None:
+        self.code = code
+        self.status_code = status_code
+        self.public_error = sanitize_diagnostic_text(message, limit=1000)
+        super().__init__(self.public_error)
+
+    def to_openai_error(self) -> dict[str, Any]:
+        return openai_error_payload(self.public_error, self.status_code, code=self.code)
+
+    @classmethod
+    def from_detail(cls, detail: object, status_code: int = 502) -> TextGenerationError:
+        if isinstance(detail, dict):
+            for key in ("error", "detail"):
+                if isinstance(detail.get(key), (dict, str)):
+                    return cls.from_detail(detail[key], status_code)
+            code = str(detail.get("code") or "upstream_error")
+            if code == "work_subscription_required":
+                status_code = 403
+            return cls(str(detail.get("message") or "Upstream text generation failed."), code, status_code)
+        return cls(detail if isinstance(detail, str) and detail else "Upstream text generation failed.",
+                   status_code=status_code)
 
 
 def _message_from_value(value: object) -> str:

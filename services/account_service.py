@@ -2089,7 +2089,7 @@ class AccountService:
             f"no image account available after {len(attempted_tokens)} attempts",
         )
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def get_text_access_token(self, excluded_tokens: set[str] | None = None, *, model: str = "auto") -> str:
         self._refresh_accounts_snapshot_if_stale()
         attempted = set(excluded_tokens or set())
         while True:
@@ -2102,6 +2102,9 @@ class AccountService:
                         allow_limited=True,
                         allow_image_pending=True,
                     )
+                       # Work-mode models require a paid subscription. Unknown
+                       # plans are checked by upstream; do not invent entitlements.
+                       and not (model.endswith("-wm") and self._normalize_account_type(account.get("type")) == "free")
                        and (token := account.get("access_token") or "")
                        and token not in attempted
                 ]

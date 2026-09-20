@@ -3554,6 +3554,7 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
+        deadline = time.monotonic() + 300
         response = self._chat_request(
             "conversation", "POST", self.base_url + path,
             headers=self._conversation_headers(path, requirements),
@@ -3561,11 +3562,66 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
-        try:
-            yield from iter_sse_payloads(response)
-        finally:
-            response.close()
+        resume_token = ""
+        conversation_id = ""
+        # Resume offset zero includes the original handoff controls. Consume
+        # those locally; never expose resume credentials or re-submit the turn.
+        for resumed in (False, True):
+            handoff = False
+            try:
+                ensure_ok(response, path)
+                for item in iter_sse_payloads(
+                    response,
+                    max_duration_secs=self._remaining_timeout(deadline, "text stream timed out"),
+                ):
+                    try:
+                        event = json.loads(item)
+                    except (ValueError, TypeError):
+                        event = None
+                    if isinstance(event, dict):
+                        kind = event.get("type")
+                        if kind == "resume_conversation_token":
+                            if not resumed:
+                                resume_token = event.get("token") if isinstance(event.get("token"), str) else ""
+                                conversation_id = event.get("conversation_id") if isinstance(event.get("conversation_id"), str) else ""
+                            continue
+                        if kind == "stream_handoff":
+                            options = event.get("options")
+                            can_resume = isinstance(options, list) and any(
+                                isinstance(option, dict) and option.get("type") == "resume_sse_endpoint"
+                                for option in options
+                            )
+                            if (
+                                not can_resume or not resume_token or not conversation_id
+                                or event.get("conversation_id") != conversation_id
+                                or len(resume_token) > 16384 or any(c in resume_token for c in "\r\n")
+                            ):
+                                raise UpstreamHTTPError("conversation_handoff", 502, {"detail": {
+                                    "code": "invalid_stream_handoff",
+                                    "message": "Upstream stream handoff could not be resumed safely.",
+                                }})
+                            if resumed:
+                                continue
+                            handoff = True
+                            break
+                    yield item
+                    if item == "[DONE]":
+                        return
+            finally:
+                response.close()
+            if not handoff:
+                return
+            path = path.rsplit("/", 1)[0] + "/f/conversation/resume"
+            response = self._chat_request(
+                "conversation_resume", "POST", self.base_url + path,
+                headers=self._headers(path, {
+                    "Accept": "text/event-stream", "Content-Type": "application/json",
+                    "x-conduit-token": resume_token,
+                }),
+                json={"conversation_id": conversation_id, "offset": 0},
+                timeout=self._remaining_timeout(deadline, "text stream timed out"),
+                stream=True,
+            )
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
